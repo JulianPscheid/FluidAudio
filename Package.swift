@@ -5,7 +5,7 @@ let package = Package(
     name: "FluidAudio",
     platforms: [
         .macOS(.v14),
-        .iOS(.v17),
+        .iOS(.v16),
     ],
     products: [
         .library(
