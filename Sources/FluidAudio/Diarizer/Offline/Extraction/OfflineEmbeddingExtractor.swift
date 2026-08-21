@@ -351,7 +351,7 @@ struct OfflineEmbeddingExtractor {
         }
 
         func performEmbeddingWarmup() throws {
-            let warmupAudioArray = try memoryOptimizer.createAlignedArray(
+            let warmupAudioArray = try MLMultiArray(
                 shape: fbankInputShape,
                 dataType: .float32
             )
@@ -789,7 +789,11 @@ struct OfflineEmbeddingExtractor {
                 array.prefetchToNeuralEngine()
             }
 
-            let output = try fbankModel.prediction(from: provider, options: options)
+            let output = try withExtendedLifetime(array) {
+                try withExtendedLifetime(provider) {
+                    try fbankModel.prediction(from: provider, options: options)
+                }
+            }
 
             guard
                 let featureArray = output.featureValue(for: fbankOutputName)?.multiArrayValue
@@ -808,7 +812,7 @@ struct OfflineEmbeddingExtractor {
         chunkPointer: UnsafePointer<Float>,
         length: Int
     ) throws -> MLMultiArray {
-        let array = try memoryOptimizer.createAlignedArray(
+        let array = try MLMultiArray(
             shape: fbankInputShape,
             dataType: .float32
         )
@@ -885,7 +889,13 @@ struct OfflineEmbeddingExtractor {
             weightsArray.prefetchToNeuralEngine()
         }
 
-        let output = try embeddingModel.prediction(from: provider, options: options)
+        let output = try withExtendedLifetime(fbankFeatures) {
+            try withExtendedLifetime(weightsArray) {
+                try withExtendedLifetime(provider) {
+                    try embeddingModel.prediction(from: provider, options: options)
+                }
+            }
+        }
         guard let embeddingArray = output.featureValue(for: embeddingOutputName)?.multiArrayValue else {
             throw OfflineDiarizationError.processingFailed("Embedding model missing \(embeddingOutputName) output")
         }

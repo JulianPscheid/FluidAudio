@@ -41,7 +41,7 @@ struct VBxClustering {
     func refine(
         rhoFeatures: [[Double]],
         initialClusters: [Int]
-    ) -> VBxOutput {
+    ) throws -> VBxOutput {
         guard !rhoFeatures.isEmpty else {
             return VBxOutput(
                 gamma: [],
@@ -133,6 +133,9 @@ struct VBxClustering {
             gammaSource = result.gamma
             piSource = result.pi
             elboHistory = result.elbos
+        } catch is CancellationError {
+            signposter.endInterval("VBx Clustering Algorithm", vbxState)
+            throw CancellationError()
         } catch {
             logger.error("VBx failed to prepare BLAS arguments: \(error.localizedDescription)")
             gammaSource = initialGamma
@@ -299,6 +302,7 @@ struct VBxClustering {
         var iterations = 0
 
         for iteration in 0..<maxIterations {
+            try Task.checkCancellation()
             iterations = iteration + 1
 
             gamma.withUnsafeBufferPointer { gammaPtr in
@@ -687,8 +691,8 @@ struct VBxClustering {
         trainingEmbeddings: [[Double]],
         initialClusters: [Int],
         constraints: SpeakerCountConstraints?
-    ) -> VBxOutput {
-        var output = refine(rhoFeatures: rhoFeatures, initialClusters: initialClusters)
+    ) throws -> VBxOutput {
+        var output = try refine(rhoFeatures: rhoFeatures, initialClusters: initialClusters)
 
         guard let constraints = constraints else {
             return output

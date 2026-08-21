@@ -176,6 +176,7 @@ public final class OfflineDiarizerManager {
                 return .continue
             }
         )
+        try Task.checkCancellation()
         let segmentationTime = Date().timeIntervalSince(segmentationStart)
         logger.debug("Segmentation completed in \(segmentationTime)s (serial)")
 
@@ -190,6 +191,7 @@ public final class OfflineDiarizerManager {
             audioSource: audioSource,
             segmentation: segmentation
         )
+        try Task.checkCancellation()
         let embeddingTime = Date().timeIntervalSince(embeddingStart)
         logger.debug("Embedding extraction produced \(timedEmbeddings.count) vectors in \(embeddingTime)s (serial)")
 
@@ -241,12 +243,13 @@ public final class OfflineDiarizerManager {
                 )
                 : nil
 
-            vbxOutput = VBxClustering(config: config, pldaTransform: pldaTransform).refineWithConstraints(
-                rhoFeatures: trainingRho,
-                trainingEmbeddings: trainingEmbeddings,
-                initialClusters: initialClusters,
-                constraints: constraints
-            )
+            vbxOutput = try VBxClustering(config: config, pldaTransform: pldaTransform)
+                .refineWithConstraints(
+                    rhoFeatures: trainingRho,
+                    trainingEmbeddings: trainingEmbeddings,
+                    initialClusters: initialClusters,
+                    constraints: constraints
+                )
         } else {
             vbxOutput = VBxOutput(
                 gamma: [],
@@ -258,6 +261,7 @@ public final class OfflineDiarizerManager {
             )
         }
 
+        try Task.checkCancellation()
         let centroidComputation = computeCentroids(
             trainingEmbeddings: trainingEmbeddings,
             vbxOutput: vbxOutput,
