@@ -756,43 +756,43 @@ struct OfflineEmbeddingExtractor {
         return result
     }
 
+    /// Run the FBANK model over `audioArrays` one prediction at a time.
+    ///
+    /// This used to build an `MLArrayBatchProvider` and issue a single
+    /// `predictions(from:options:)` covering up to `embeddingBatchSize` (32) windows.
+    /// Core ML fans a batch out across `com.apple.e5rt.concurrentExecutionQueue`, so one
+    /// call put several `BNNSGraphContextExecute_v2` executions of the same graph in
+    /// flight at once. That concurrency intermittently corrupts internal E5RT/BNNS
+    /// scratch state and segfaults in `_platform_memmove` with a wild destination
+    /// pointer (EXC_BAD_ACCESS). Issuing the predictions serially keeps exactly one
+    /// FBANK graph executing at a time.
+    ///
+    /// Batching is still used upstream of here to bound memory; only the Core ML
+    /// submission is serialized. Outputs stay in input order, so callers are unchanged.
     private func runFbankBatch(
         audioArrays: [MLMultiArray]
     ) throws -> [MLMultiArray] {
         guard !audioArrays.isEmpty else { return [] }
-        var providers: [MLFeatureProvider] = []
-        providers.reserveCapacity(audioArrays.count)
-        for array in audioArrays {
-            providers.append(
-                ZeroCopyDiarizerFeatureProvider(
-                    features: [
-                        fbankInputName: MLFeatureValue(multiArray: array)
-                    ]
-                )
-            )
-        }
 
         let options = MLPredictionOptions()
-        if #available(macOS 14.0, iOS 17.0, *) {
-            for array in audioArrays {
-                array.prefetchToNeuralEngine()
-            }
-        }
-
-        let batchProvider = MLArrayBatchProvider(array: providers)
-        let outputBatch = try fbankModel.predictions(from: batchProvider, options: options)
-        guard outputBatch.count == audioArrays.count else {
-            throw OfflineDiarizationError.processingFailed(
-                "FBANK batch produced \(outputBatch.count) outputs for \(audioArrays.count) inputs"
-            )
-        }
 
         var results: [MLMultiArray] = []
-        results.reserveCapacity(outputBatch.count)
-        for index in 0..<outputBatch.count {
+        results.reserveCapacity(audioArrays.count)
+
+        for (index, array) in audioArrays.enumerated() {
+            let provider = ZeroCopyDiarizerFeatureProvider(
+                features: [
+                    fbankInputName: MLFeatureValue(multiArray: array)
+                ]
+            )
+            if #available(macOS 14.0, iOS 17.0, *) {
+                array.prefetchToNeuralEngine()
+            }
+
+            let output = try fbankModel.prediction(from: provider, options: options)
+
             guard
-                let featureArray = outputBatch.features(at: index)
-                    .featureValue(for: fbankOutputName)?.multiArrayValue
+                let featureArray = output.featureValue(for: fbankOutputName)?.multiArrayValue
             else {
                 throw OfflineDiarizationError.processingFailed(
                     "FBANK model missing \(fbankOutputName) output at batch index \(index)"

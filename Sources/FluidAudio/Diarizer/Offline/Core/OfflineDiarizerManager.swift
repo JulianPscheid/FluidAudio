@@ -150,78 +150,48 @@ public final class OfflineDiarizerManager {
         let totalChunks = max(
             1, (audioSource.sampleCount + config.samplesPerStep - 1) / config.samplesPerStep)
 
-        let streamPair = AsyncThrowingStream<SegmentationChunk, Error>.makeStream()
-        let chunkStream = streamPair.stream
-        let chunkContinuation = streamPair.continuation
-
-        // Capture models for concurrent tasks
-        let capturedModels = models
-        let capturedConfig = config
-
-        let segmentationTask = Task.detached(priority: .userInitiated) {
-            [capturedModels, capturedConfig] () throws -> (SegmentationOutput, TimeInterval) in
-            let processor = OfflineSegmentationProcessor()
-            let start = Date()
-            do {
-                let segmentation = try await processor.process(
-                    audioSource: audioSource,
-                    segmentationModel: capturedModels.segmentationModel,
-                    config: capturedConfig,
-                    chunkHandler: { chunk in
-                        progressCallback?(chunk.chunkIndex + 1, totalChunks)
-                        switch chunkContinuation.yield(chunk) {
-                        case .enqueued, .dropped:
-                            return .continue
-                        case .terminated:
-                            return .stop
-                        @unknown default:
-                            return .stop
-                        }
-                    }
-                )
-                chunkContinuation.finish()
-                return (segmentation, Date().timeIntervalSince(start))
-            } catch {
-                chunkContinuation.finish(throwing: error)
-                throw error
+        // Run segmentation to completion BEFORE extracting embeddings.
+        //
+        // These two stages used to run as overlapping `Task.detached` pipelines joined
+        // by an `AsyncThrowingStream`, so the pyannote segmentation model and the
+        // WeSpeaker FBANK model executed Core ML predictions at the same time. On Apple
+        // Silicon that puts two model families on the shared
+        // `com.apple.e5rt.concurrentExecutionQueue` at once, which intermittently
+        // corrupts internal E5RT/BNNS scratch state and segfaults inside
+        // `BNNSGraphContextExecute_v2` (`_platform_memmove`, EXC_BAD_ACCESS on a wild
+        // destination pointer). See issue #661 for the same signature across two
+        // managers; this is the same failure inside a single `process()` call.
+        //
+        // Sequencing costs peak parallelism but not correctness: `extractEmbeddings`
+        // already has a non-streaming overload that takes a finished `SegmentationOutput`
+        // and replays it as chunks, so the embedding stage is unchanged.
+        let segmentationStart = Date()
+        let processor = OfflineSegmentationProcessor()
+        let segmentation = try await processor.process(
+            audioSource: audioSource,
+            segmentationModel: models.segmentationModel,
+            config: config,
+            chunkHandler: { chunk in
+                progressCallback?(chunk.chunkIndex + 1, totalChunks)
+                return .continue
             }
-        }
+        )
+        let segmentationTime = Date().timeIntervalSince(segmentationStart)
+        logger.debug("Segmentation completed in \(segmentationTime)s (serial)")
 
-        let embeddingTask = Task.detached(priority: .userInitiated) {
-            [capturedModels, capturedConfig] () throws -> ([TimedEmbedding], TimeInterval) in
-            let extractor = OfflineEmbeddingExtractor(
-                fbankModel: capturedModels.fbankModel,
-                embeddingModel: capturedModels.embeddingModel,
-                pldaTransform: PLDATransform(pldaRhoModel: capturedModels.pldaRhoModel, psi: capturedModels.pldaPsi),
-                config: capturedConfig
-            )
-            let start = Date()
-            let embeddings = try await extractor.extractEmbeddings(
-                audioSource: audioSource,
-                segmentationStream: chunkStream
-            )
-            return (embeddings, Date().timeIntervalSince(start))
-        }
-
-        let segmentationResult: (SegmentationOutput, TimeInterval)
-        let embeddingResult: ([TimedEmbedding], TimeInterval)
-        do {
-            async let awaitedSegmentation = segmentationTask.value
-            async let awaitedEmbeddings = embeddingTask.value
-            segmentationResult = try await awaitedSegmentation
-            embeddingResult = try await awaitedEmbeddings
-        } catch {
-            segmentationTask.cancel()
-            embeddingTask.cancel()
-            chunkContinuation.finish(throwing: error)
-            throw error
-        }
-
-        let (segmentation, segmentationTime) = segmentationResult
-        logger.debug("Segmentation completed in \(segmentationTime)s (async)")
-
-        let (timedEmbeddings, embeddingTime) = embeddingResult
-        logger.debug("Embedding extraction produced \(timedEmbeddings.count) vectors in \(embeddingTime)s (async)")
+        let extractor = OfflineEmbeddingExtractor(
+            fbankModel: models.fbankModel,
+            embeddingModel: models.embeddingModel,
+            pldaTransform: PLDATransform(pldaRhoModel: models.pldaRhoModel, psi: models.pldaPsi),
+            config: config
+        )
+        let embeddingStart = Date()
+        let timedEmbeddings = try await extractor.extractEmbeddings(
+            audioSource: audioSource,
+            segmentation: segmentation
+        )
+        let embeddingTime = Date().timeIntervalSince(embeddingStart)
+        logger.debug("Embedding extraction produced \(timedEmbeddings.count) vectors in \(embeddingTime)s (serial)")
 
         let pldaTransform = PLDATransform(pldaRhoModel: models.pldaRhoModel, psi: models.pldaPsi)
 
