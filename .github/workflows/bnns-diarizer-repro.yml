@@ -132,13 +132,32 @@ jobs:
           swift --version
           xcodebuild -version
 
-      - name: Compute-device probe (ANE present?) — AUTHORITATIVE
+      - name: Compute-device probe (ANE present?) — DIAGNOSTIC ONLY, NEVER FATAL
         # `ioreg | grep -i ane` returns nothing even on a bare-metal M2 Pro that
         # demonstrably has an ANE, so an empty result there proves nothing.
         # MLModel.availableComputeDevices is the supported API (macOS 14+).
+        #
+        # MUST be compiled, not run as `swift ane_probe.swift`. Script mode JITs
+        # the file and eagerly resolves every symbol it references; on macOS
+        # 14.8.7 that fails with
+        #   JIT session error: Symbols not found: [ _$s6CoreML15MLComputeDeviceO... ]
+        # and exit 255. A compiled binary resolves those through the normal
+        # availability path instead. Run 33185381340 lost all six macOS jobs to
+        # this, ~40 s in, before a single diarization ran.
+        #
+        # And it is `continue-on-error` on purpose: this step measures the
+        # runner, it does not test FluidAudio. A probe that cannot answer must
+        # cost us the answer, never the run.
+        continue-on-error: true
         run: |
-          set -euo pipefail
-          swift ci/ane_probe.swift | tee ane.txt
+          set +e
+          set -u -o pipefail
+          if swiftc -O -target arm64-apple-macos14.0 -o /tmp/ane_probe ci/ane_probe.swift 2>compile.log; then
+            /tmp/ane_probe > ane.txt 2>&1 || echo "PROBE BINARY FAILED AT RUNTIME (rc=$?)" >> ane.txt
+          else
+            { echo "PROBE FAILED TO COMPILE — compute mix UNKNOWN for this job."; cat compile.log; } > ane.txt
+          fi
+          cat ane.txt
           {
             echo "### Compute devices"
             echo '```'
