@@ -1,0 +1,8 @@
+[
+  {"variant": "unpatched",    "mode": "diarizer-only",  "audio": "8min", "iterations": 250, "cpu_load": 0},
+  {"variant": "lifetimeonly", "mode": "diarizer-only",  "audio": "8min", "iterations": 250, "cpu_load": 0},
+  {"variant": "shipped",      "mode": "diarizer-only",  "audio": "8min", "iterations": 250, "cpu_load": 0},
+  {"variant": "unpatched",    "mode": "asr-concurrent", "audio": "8min", "iterations": 150, "cpu_load": 0},
+  {"variant": "lifetimeonly", "mode": "asr-concurrent", "audio": "8min", "iterations": 150, "cpu_load": 0},
+  {"variant": "shipped",      "mode": "asr-concurrent", "audio": "8min", "iterations": 150, "cpu_load": 0}
+]

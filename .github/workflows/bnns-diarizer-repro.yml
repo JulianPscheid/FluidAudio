@@ -1,0 +1,362 @@
+# BNNS offline-diarizer crash reproduction on macOS 14 (Sonoma) — the affected
+# user's OS family. Matrix version: one dispatch fans out over
+# variant x mode x audio.
+#
+# Why this exists: the target crash (EXC_BAD_ACCESS, 4-byte WRITE into an
+# unmapped VM gap, faulting thread on com.apple.e5rt.concurrentExecutionQueue,
+# _platform_memmove <- BNNSGraphContextExecute_v2 <- BnnsCpuInferenceOperation)
+# reproduces for a user on macOS 14.6.1 (23G93) / Mac14,9 / M2 Pro. 138 local
+# runs on macOS 26.6.2 never reproduced it. `macos-14` is the closest OS match
+# that is still available.
+#
+# RUNNER CAVEATS, recorded because a result without them is worthless:
+#   - image OS is macOS 14.8.7 (23J520), NOT the user's 14.6.1 (23G93)
+#   - 3 vCPU / 7 GB VM (M1), vs the user's 12-core M2 Pro
+#   - default Xcode on this image is 15.4 (Swift 5.10) which CANNOT build
+#     swift-tools-version 6.0 — we select Xcode 16.2 (Swift 6.0.3) explicitly.
+#     Local runs used Swift 6.3.3. Toolchain delta is real; recorded, not hidden.
+#   - the ANE probe step decides whether .cpuAndNeuralEngine actually reaches an
+#     ANE. Hosted Apple Silicon runners are VMs and may not expose one.
+#   - macos-14 is DEPRECATED (actions/runner-images#13518): brownouts start
+#     2026-10-05, full retirement 2026-11-02. Queue times may be long.
+
+name: BNNS diarizer repro matrix
+
+# The workflow lives ONLY on the `ci/bnns-macos14` branch; the fork's default
+# branch is deliberately left untouched so upstream PRs from this fork stay
+# clean. `workflow_dispatch` therefore is NOT available (GitHub only exposes it
+# for workflows present on the default branch) — a run is launched by pushing to
+# `ci/bnns-macos14`, and re-launched with `gh run rerun`. The matrix itself is
+# committed as `ci/matrix.json` so every run is reproducible from the ref alone.
+on:
+  push:
+    branches: ["ci/bnns-macos14"]
+  workflow_dispatch:
+    inputs:
+      matrix:
+        description: 'JSON array of jobs; blank = use the committed ci/matrix.json'
+        type: string
+        default: ''
+      assets_repo:
+        description: "owner/repo holding the audio release assets"
+        type: string
+        default: "JulianPscheid/FluidAudio"
+      assets_tag:
+        description: "release tag holding the audio assets"
+        type: string
+        default: "bnns-repro-assets"
+      budget_minutes:
+        description: "Stop starting new iterations after this many minutes (leaves room to upload artifacts)"
+        type: string
+        default: "300"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    # Resolves the matrix once, cheaply, so the expensive macOS jobs never have
+    # to. Prefers an explicit dispatch input, else the committed ci/matrix.json.
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: pick
+        run: |
+          set -euo pipefail
+          IN='${{ inputs.matrix }}'
+          if [ -n "$IN" ]; then
+            echo "using dispatch input"
+            M="$IN"
+          else
+            echo "using committed ci/matrix.json"
+            M=$(cat ci/matrix.json)
+          fi
+          echo "$M" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert isinstance(d,list) and d, "matrix must be a non-empty JSON array"; print(json.dumps(d))' > /tmp/m.json
+          echo "matrix=$(cat /tmp/m.json)" >> "$GITHUB_OUTPUT"
+          echo "### Planned matrix" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          python3 -m json.tool /tmp/m.json >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  repro:
+    needs: plan
+    name: ${{ matrix.job.variant }}/${{ matrix.job.mode }}/${{ matrix.job.audio }}
+    runs-on: macos-14
+    timeout-minutes: 350          # GitHub-hosted hard cap is 360 min/job
+    strategy:
+      fail-fast: false
+      matrix:
+        job: ${{ fromJSON(needs.plan.outputs.matrix) }}
+
+    env:
+      UNPATCHED_REV:  19600a485baa4998812e4654b70d2bab8f2c9949
+      SERIALIZE_REV:  d79cf8e31c158d0f030689d344b877c09a299c20
+      SHIPPED_REV:    9195861244f69d892ff3ab77a831dcbfe65c5bee
+      WAV79_NAME:     meeting_79min_16k_mono.wav
+      WAV79_SHA:      08168b91c672839f71bca31d0906af15482f5ed9f2d2c900cf871fad8d81a553
+      WAV8_NAME:      gm_8min_16k_mono.wav
+      WAV8_SHA:       ff5708e8416b7f949837cd5587c9ec84c9e79ece836c8fb7c11a11c322d6685f
+      ASRWAV_NAME:    smoke_3min.wav
+      ASRWAV_SHA:     cd19c33b445af2e3821f3be626e9cd623fb2ad508bf95aacc720d278ccd821d0
+      HARNESS_SHA:    bd3efbaae816561b6b031d96dc184af16478c314648a39766550cc7168e9d83f
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner fingerprint (RECORD THIS — results are meaningless without it)
+        run: |
+          set -x
+          sw_vers
+          uname -a
+          sysctl -n machdep.cpu.brand_string || true
+          sysctl -n hw.model hw.ncpu hw.memsize
+          df -h /
+          {
+            echo "### Runner"
+            echo '```'
+            sw_vers
+            sysctl -n hw.model hw.ncpu hw.memsize
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Select Xcode 16.2 (default 15.4 cannot build swift-tools-version 6.0)
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s /Applications/Xcode_16.2.app
+          swift --version
+          xcodebuild -version
+
+      - name: Compute-device probe (ANE present?) — AUTHORITATIVE
+        # `ioreg | grep -i ane` returns nothing even on a bare-metal M2 Pro that
+        # demonstrably has an ANE, so an empty result there proves nothing.
+        # MLModel.availableComputeDevices is the supported API (macOS 14+).
+        run: |
+          set -euo pipefail
+          swift ci/ane_probe.swift | tee ane.txt
+          {
+            echo "### Compute devices"
+            echo '```'
+            cat ane.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clone FluidAudio fork and materialise the variant
+        run: |
+          set -euo pipefail
+          git clone --no-single-branch https://github.com/JulianPscheid/FluidAudio.git fluidaudio
+          cd fluidaudio
+          case "${{ matrix.job.variant }}" in
+            unpatched)      REV="$UNPATCHED_REV" ;;
+            serialize-only) REV="$SERIALIZE_REV" ;;
+            shipped)        REV="$SHIPPED_REV" ;;
+            lifetimeonly)   REV="$UNPATCHED_REV" ;;
+            *) echo "::error::unknown variant '${{ matrix.job.variant }}'"; exit 1 ;;
+          esac
+          git checkout --detach "$REV"
+          git rev-parse HEAD
+          if [ "${{ matrix.job.variant }}" = "lifetimeonly" ]; then
+            # Variant B: v0.15.5 + ONLY the OfflineEmbeddingExtractor memory-lifetime
+            # changes (Core ML-owned FBank MLMultiArray + withExtendedLifetime).
+            # NOT a pure cherry-pick of 91958612: that commit wraps a SERIAL
+            # prediction, this keeps v0.15.5's batch, so the wrap was adapted to
+            # cover audioArrays / providers / batchProvider. Deviation recorded.
+            git apply --verbose "$GITHUB_WORKSPACE/ci/variant-B-lifetimeonly.patch"
+            git --no-pager diff --stat
+          fi
+
+      - name: Write harness (ONE shared source for every variant)
+        run: |
+          set -euo pipefail
+          mkdir -p harness/Sources/bnnsharness
+          cat > harness/Package.swift <<'EOF'
+          // swift-tools-version: 6.0
+          import PackageDescription
+          let package = Package(
+              name: "bnnsharness",
+              platforms: [.macOS(.v14)],
+              dependencies: [.package(path: "../fluidaudio")],
+              targets: [.executableTarget(name: "bnnsharness",
+                  dependencies: [.product(name: "FluidAudio", package: "fluidaudio")])]
+          )
+          EOF
+          cp ci/Harness.swift harness/Sources/bnnsharness/Harness.swift
+          ACTUAL=$(shasum -a 256 harness/Sources/bnnsharness/Harness.swift | awk '{print $1}')
+          echo "harness sha256: $ACTUAL"
+          if [ "$ACTUAL" != "$HARNESS_SHA" ]; then
+            echo "::error::Harness source drifted from the source of truth ($HARNESS_SHA)."
+            echo "::error::Every variant must be built from ONE identical harness or the comparison is void."
+            exit 1
+          fi
+
+      - name: Build harness
+        run: |
+          set -euo pipefail
+          cd harness && swift build -c release
+          ls -la .build/release/bnnsharness
+
+      - name: Obtain audio (byte-identical to the local runs, or FAIL LOUDLY)
+        run: |
+          set -euo pipefail
+          mkdir -p audio
+          BASE="https://github.com/${{ inputs.assets_repo || 'JulianPscheid/FluidAudio' }}/releases/download/${{ inputs.assets_tag || 'bnns-repro-assets' }}"
+          fetch () { # name sha
+            echo "fetching $1"
+            curl -fsSL --retry 5 --retry-all-errors -o "audio/$1" "$BASE/$1"
+            local A; A=$(shasum -a 256 "audio/$1" | awk '{print $1}')
+            echo "  expected $2"
+            echo "  actual   $A"
+            if [ "$A" != "$2" ]; then
+              echo "::error::sha256 MISMATCH for $1 — CI results would NOT be comparable to the local runs."
+              echo "::error::Do not silently proceed with different audio."
+              exit 1
+            fi
+          }
+          if [ "${{ matrix.job.audio }}" = "79min" ]; then
+            fetch "$WAV79_NAME" "$WAV79_SHA"
+            echo "DIAR_WAV=audio/$WAV79_NAME" >> "$GITHUB_ENV"
+          else
+            fetch "$WAV8_NAME" "$WAV8_SHA"
+            echo "DIAR_WAV=audio/$WAV8_NAME" >> "$GITHUB_ENV"
+          fi
+          if [ "${{ matrix.job.mode }}" = "asr-concurrent" ]; then
+            fetch "$ASRWAV_NAME" "$ASRWAV_SHA"
+            echo "BNNS_ASR_WAV=$PWD/audio/$ASRWAV_NAME" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run loop (fresh process per iteration)
+        id: loop
+        run: |
+          # GitHub invokes `bash -eo pipefail`; -e would abort the step on the
+          # first crashing iteration, which is the exact event we are here to
+          # record. Turn it off deliberately.
+          set +e
+          set -u -o pipefail
+          BIN="harness/.build/release/bnnsharness"
+          WAV="$DIAR_WAV"
+          ITERS="${{ matrix.job.iterations }}"
+          BUDGET=$(( ${{ inputs.budget_minutes || '300' }} * 60 ))
+          mkdir -p results/logs results/crashes
+          CSV=results/runs.csv
+          echo "iteration,started_utc,wall_seconds,exit_code,signal,crash_report,segments,speakers" > "$CSV"
+          DR="$HOME/Library/Logs/DiagnosticReports"
+          mkdir -p "$DR"
+
+          {
+            echo "variant=${{ matrix.job.variant }} mode=${{ matrix.job.mode }} audio=${{ matrix.job.audio }}"
+            echo "rev=$(git -C fluidaudio rev-parse HEAD)"
+            echo "diar_wav_sha256=$(shasum -a 256 "$WAV" | awk '{print $1}')"
+            echo "asr_wav=${BNNS_ASR_WAV:-none}"
+            echo "swift=$(swift --version 2>&1 | head -1)"
+            echo "os=$(sw_vers -productVersion) ($(sw_vers -buildVersion))"
+          } | tee results/meta.txt
+
+          # macOS ships bash 3.2, where "${arr[@]:-}" on an empty array trips
+          # set -u. Track spin workers in a file instead of an array.
+          : > /tmp/loadpids
+          CPU_LOAD="${{ matrix.job.cpu_load }}"
+          if [ "$CPU_LOAD" -gt 0 ]; then
+            for _ in $(seq 1 "$CPU_LOAD"); do ( while :; do :; done ) & echo $! >> /tmp/loadpids; done
+            echo "started $CPU_LOAD spin workers"
+          fi
+          cleanup () { while read -r p; do kill "$p" 2>/dev/null; done < /tmp/loadpids; }
+          trap cleanup EXIT
+
+          LOOP_T0=$(python3 -c 'import time;print(time.time())')
+          COMPLETED=0
+          for i in $(seq 1 "$ITERS"); do
+            NOW=$(python3 -c 'import time;print(time.time())')
+            ELAPSED=$(python3 -c "print(int($NOW-$LOOP_T0))")
+            if [ "$ELAPSED" -ge "$BUDGET" ]; then
+              echo "::notice::Budget ${BUDGET}s reached after $COMPLETED iterations — stopping so artifacts still upload."
+              break
+            fi
+            START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            T0=$(python3 -c 'import time;print(time.time())')
+            "$BIN" "$WAV" "${{ matrix.job.variant }}-$i" > "results/logs/run-$i.log" 2>&1
+            RC=$?
+            T1=$(python3 -c 'import time;print(time.time())')
+            WALL=$(python3 -c "print(f'{$T1-$T0:.1f}')")
+            SIG=""; [ "$RC" -gt 128 ] && SIG=$(kill -l $((RC-128)) 2>/dev/null)
+            SEG=$(grep -o 'segments=[0-9]*'  "results/logs/run-$i.log" | tail -1 | cut -d= -f2)
+            SPK=$(grep -o 'speakers=[0-9]*'  "results/logs/run-$i.log" | tail -1 | cut -d= -f2)
+            CRASH=""
+            if [ -n "$SIG" ]; then
+              for _ in $(seq 1 10); do
+                NEW=$(ls -t "$DR" 2>/dev/null | grep -i '^bnnsharness' | head -1)
+                if [ -n "$NEW" ] && [ ! -f "results/crashes/$NEW" ]; then
+                  cp "$DR/$NEW" "results/crashes/$NEW" 2>/dev/null && CRASH="$NEW" && break
+                fi
+                /bin/sleep 2
+              done
+            fi
+            echo "$i,$START,$WALL,$RC,$SIG,$CRASH,${SEG:-},${SPK:-}" >> "$CSV"
+            echo "iter=$i rc=$RC sig=${SIG:-none} wall=${WALL}s seg=${SEG:-?} spk=${SPK:-?} crash=${CRASH:-none}"
+            COMPLETED=$i
+          done
+
+          SIGCOUNT=$(awk -F, 'NR>1 && $4>128' "$CSV" | wc -l | tr -d ' ')
+          echo "completed=$COMPLETED"   >> "$GITHUB_OUTPUT"
+          echo "signalled=$SIGCOUNT"    >> "$GITHUB_OUTPUT"
+          echo "=== completed $COMPLETED iterations, signal-terminated: $SIGCOUNT"
+
+      - name: Strict crash-signature check (markers must be on the FAULTING thread)
+        if: always()
+        run: |
+          set +e
+          set -u -o pipefail
+          shopt -s nullglob
+          chmod +x ci/check_signature.sh
+          reports=(results/crashes/*.ips)
+          TARGET=0
+          OTHER=0
+          if [ ${#reports[@]} -eq 0 ]; then
+            echo "No crash reports."
+          else
+            for r in "${reports[@]}"; do
+              OUT=$(./ci/check_signature.sh "$r")
+              echo "$OUT"
+              if echo "$OUT" | grep -q "VERDICT: TARGET SIGNATURE"; then
+                TARGET=$((TARGET+1))
+              else
+                OTHER=$((OTHER+1))
+              fi
+            done
+          fi
+          {
+            echo "### Result — ${{ matrix.job.variant }} / ${{ matrix.job.mode }} / ${{ matrix.job.audio }}"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| iterations completed | ${{ steps.loop.outputs.completed }} |"
+            echo "| signal-terminated | ${{ steps.loop.outputs.signalled }} |"
+            echo "| **TARGET-signature crashes** | **$TARGET** |"
+            echo "| other crashes | $OTHER |"
+            echo ""
+            echo '```'
+            cat results/meta.txt 2>/dev/null
+            echo '```'
+            echo ""
+            echo '```'
+            cat results/runs.csv 2>/dev/null
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "TARGET=$TARGET OTHER=$OTHER"
+
+      - name: Upload results (NEVER the WAV)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bnns-${{ matrix.job.variant }}-${{ matrix.job.mode }}-${{ matrix.job.audio }}-${{ github.run_id }}
+          path: |
+            results/runs.csv
+            results/meta.txt
+            results/logs/
+            results/crashes/
+          retention-days: 30
+          if-no-files-found: warn
