@@ -379,7 +379,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bnns-${{ matrix.job.variant }}-${{ matrix.job.mode }}-${{ matrix.job.audio }}-${{ github.run_id }}
+          name: bnns-${{ matrix.job.runner || 'macos-14' }}-${{ matrix.job.variant }}-${{ matrix.job.mode }}-${{ matrix.job.audio }}-${{ github.run_id }}
           path: |
             results/runs.csv
             results/meta.txt
