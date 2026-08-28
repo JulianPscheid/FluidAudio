@@ -351,7 +351,7 @@ struct OfflineEmbeddingExtractor {
         }
 
         func performEmbeddingWarmup() throws {
-            let warmupAudioArray = try memoryOptimizer.createAlignedArray(
+            let warmupAudioArray = try MLMultiArray(
                 shape: fbankInputShape,
                 dataType: .float32
             )
@@ -780,7 +780,13 @@ struct OfflineEmbeddingExtractor {
         }
 
         let batchProvider = MLArrayBatchProvider(array: providers)
-        let outputBatch = try fbankModel.predictions(from: batchProvider, options: options)
+        let outputBatch = try withExtendedLifetime(audioArrays) {
+            try withExtendedLifetime(providers) {
+                try withExtendedLifetime(batchProvider) {
+                    try fbankModel.predictions(from: batchProvider, options: options)
+                }
+            }
+        }
         guard outputBatch.count == audioArrays.count else {
             throw OfflineDiarizationError.processingFailed(
                 "FBANK batch produced \(outputBatch.count) outputs for \(audioArrays.count) inputs"
@@ -808,7 +814,7 @@ struct OfflineEmbeddingExtractor {
         chunkPointer: UnsafePointer<Float>,
         length: Int
     ) throws -> MLMultiArray {
-        let array = try memoryOptimizer.createAlignedArray(
+        let array = try MLMultiArray(
             shape: fbankInputShape,
             dataType: .float32
         )
@@ -885,7 +891,13 @@ struct OfflineEmbeddingExtractor {
             weightsArray.prefetchToNeuralEngine()
         }
 
-        let output = try embeddingModel.prediction(from: provider, options: options)
+        let output = try withExtendedLifetime(fbankFeatures) {
+            try withExtendedLifetime(weightsArray) {
+                try withExtendedLifetime(provider) {
+                    try embeddingModel.prediction(from: provider, options: options)
+                }
+            }
+        }
         guard let embeddingArray = output.featureValue(for: embeddingOutputName)?.multiArrayValue else {
             throw OfflineDiarizationError.processingFailed("Embedding model missing \(embeddingOutputName) output")
         }
