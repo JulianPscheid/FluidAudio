@@ -86,8 +86,12 @@ jobs:
 
   repro:
     needs: plan
-    name: ${{ matrix.job.variant }}/${{ matrix.job.mode }}/${{ matrix.job.audio }}
-    runs-on: macos-14
+    name: ${{ matrix.job.runner || 'macos-14' }}/${{ matrix.job.variant }}/${{ matrix.job.mode }}/${{ matrix.job.audio }}
+    # Defaults to macos-14 (the affected OS family). Overridable per matrix entry
+    # so the same harness can be pointed at macos-15/macos-26 to separate "this
+    # OS" from "this hosted VM has no ANE" — two variables that are otherwise
+    # confounded in every CI result.
+    runs-on: ${{ matrix.job.runner || 'macos-14' }}
     timeout-minutes: 350          # GitHub-hosted hard cap is 360 min/job
     strategy:
       fail-fast: false
@@ -125,10 +129,14 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Select Xcode 16.2 (default 15.4 cannot build swift-tools-version 6.0)
+      - name: Select a Swift 6 toolchain (macos-14 defaults to Xcode 15.4 / Swift 5.10)
         run: |
           set -euo pipefail
-          sudo xcode-select -s /Applications/Xcode_16.2.app
+          # Only pin on macos-14, whose default cannot build swift-tools-version 6.0.
+          # Newer images already default to a Swift 6 toolchain and do not ship 16.2.
+          if [ -d /Applications/Xcode_16.2.app ] && [ "${{ matrix.job.runner || 'macos-14' }}" = "macos-14" ]; then
+            sudo xcode-select -s /Applications/Xcode_16.2.app
+          fi
           swift --version
           xcodebuild -version
 
@@ -152,7 +160,7 @@ jobs:
         run: |
           set +e
           set -u -o pipefail
-          if swiftc -O -target arm64-apple-macos14.0 -o /tmp/ane_probe ci/ane_probe.swift 2>compile.log; then
+          if swiftc -O -o /tmp/ane_probe ci/ane_probe.swift 2>compile.log; then
             /tmp/ane_probe > ane.txt 2>&1 || echo "PROBE BINARY FAILED AT RUNTIME (rc=$?)" >> ane.txt
           else
             { echo "PROBE FAILED TO COMPILE — compute mix UNKNOWN for this job."; cat compile.log; } > ane.txt
